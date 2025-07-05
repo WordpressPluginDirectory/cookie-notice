@@ -28,12 +28,23 @@ class Cookie_Notice_Privacy_Consent {
 	}
 
 	/**
-	 * Get all sources.
+	 * Get all sources data.
 	 *
 	 * @return array
 	 */
 	public function get_sources() {
 		return $this->sources;
+	}
+
+	/**
+	 * Get single source data.
+	 *
+	 * @param array $source_id
+	 *
+	 * @return array
+	 */
+	public function get_source( $source_id ) {
+		return array_key_exists( $source_id, $this->sources ) ? $this->sources[$source_id] : [];
 	}
 
 	/**
@@ -91,6 +102,56 @@ class Cookie_Notice_Privacy_Consent {
 	}
 
 	/**
+	 * Strip string to specified length removing multibyte character from the end if needed.
+	 *
+	 * @param string $str
+	 * @param int $length
+	 *
+	 * @return string
+	 */
+	public function strcut( $str = '', $length = 100 ) {
+		if ( function_exists( 'mb_strcut' ) )
+			return mb_strcut( $str, 0, $length );
+
+		// get length
+		$str_length = strlen( $str );
+
+		// smaller string?
+		if ( $str_length <= $length )
+			return $str;
+
+		// check any multibyte characters
+		preg_match_all( '/./u', $str, $chars );
+
+		if ( ! empty( $chars[0] ) ) {
+			// no multibyte characters
+			if ( count( $chars[0] ) === $str_length )
+				return $str;
+
+			$mb_str_length = 0;
+
+			// check every character
+			foreach ( $chars[0] as $char ) {
+				// get character length
+				$mb_char_length = strlen( $char );
+
+				// length with new character
+				$new_str_length = $mb_str_length + $mb_char_length;
+
+				// longer then expected? cut just before new character
+				if ( $new_str_length > $length )
+					return substr( $str, 0, $mb_str_length );
+				// perfect length? cut without stripping
+				elseif ( $new_str_length === $length )
+					return substr( $str, 0, $new_str_length );
+
+				$mb_str_length += $mb_char_length;
+			}
+		} else
+			return substr( $str, 0, 100 );
+	}
+
+	/**
 	 * Add instance.
 	 *
 	 * @param object $instance
@@ -131,6 +192,7 @@ class Cookie_Notice_Privacy_Consent {
 		include_once( COOKIE_NOTICE_PATH . '/includes/modules/mailchimp/privacy-consent.php' );
 		include_once( COOKIE_NOTICE_PATH . '/includes/modules/woocommerce/privacy-consent.php' );
 		include_once( COOKIE_NOTICE_PATH . '/includes/modules/wpforms/privacy-consent.php' );
+		include_once( COOKIE_NOTICE_PATH . '/includes/modules/formidable-forms/privacy-consent.php' );
 
 		// update 2.5.0
 		if ( version_compare( $cn->db_version, '2.4.18', '<=' ) ) {
@@ -239,7 +301,7 @@ class Cookie_Notice_Privacy_Consent {
 					<div class="cn_compliance_status"><span class="cn-status-label">' . esc_html__( 'Proof-of-Consent', 'cookie-notice' ) . '</span>: <span class="cn-status cn-active"><span class="cn-icon"></span> ' . esc_html__( 'Active', 'cookie-notice' ) . '</span></div>
 				</div>
 				<div id="cn_app_actions">
-					<a href="' . esc_url( $cn->get_url( 'host', '?utm_campaign=configure&utm_source=wordpress&utm_medium=button#/login' ) ) . '" class="button button-primary button-hero cn-button" target="_blank">' . esc_html__( 'Log in & Configure', 'cookie-notice' ) . '</a>
+					<a href="' . esc_url( $cn->get_url( 'host', '?utm_campaign=configure&utm_source=wordpress&utm_medium=button#/dashboard' ) ) . '" class="button button-primary button-hero cn-button" target="_blank">' . esc_html__( 'Log in & Configure', 'cookie-notice' ) . '</a>
 					<p class="description">' . esc_html__( 'Log in to the Cookie Compliance&trade; dashboard to explore, configure and manage its functionalities.', 'cookie-notice' ) . '</p>
 				</div>';
 				break;
@@ -252,7 +314,7 @@ class Cookie_Notice_Privacy_Consent {
 					<div class="cn_compliance_status"><span class="cn-status-label">' . esc_html__( 'Proof-of-Consent', 'cookie-notice' ) . '</span>: <span class="cn-status cn-pending"><span class="cn-icon"></span> ' . esc_html__( 'Pending', 'cookie-notice' ) . '</span></div>
 				</div>
 				<div id="cn_app_actions">
-					<a href="' . esc_url( $cn->get_url( 'host', '?utm_campaign=configure&utm_source=wordpress&utm_medium=button#/login' ) ) . '" class="button button-primary button-hero cn-button" target="_blank">' . esc_html__( 'Log in & configure', 'cookie-notice' ) . '</a>
+					<a href="' . esc_url( $cn->get_url( 'host', '?utm_campaign=configure&utm_source=wordpress&utm_medium=button#/dashboard' ) ) . '" class="button button-primary button-hero cn-button" target="_blank">' . esc_html__( 'Log in & Configure', 'cookie-notice' ) . '</a>
 					<p class="description">' . esc_html__( 'Log in to the Cookie Compliance&trade; web application and complete the setup process.', 'cookie-notice' ) . '</p>
 				</div>';
 				break;
@@ -452,7 +514,7 @@ class Cookie_Notice_Privacy_Consent {
 		$list_table->prepare_items();
 
 		ob_start();
-		$list_table->search_box( __( 'Search', 'cookie-notice' ), $source );
+		// $list_table->search_box( __( 'Search', 'cookie-notice' ), $source );
 		$list_table->display();
 		$display = ob_get_clean();
 
