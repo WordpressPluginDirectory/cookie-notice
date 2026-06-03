@@ -1,14 +1,14 @@
 === Compliance by Hu-manity.co ===
 Contributors: humanityco
-Tags: gdpr, ccpa, cookies, consent, privacy
+Tags: gdpr, ccpa, cookies, consent, privacy, gpc, google-consent-mode
 Requires at least: 4.9.6
 Requires PHP: 7.4
 Tested up to: 6.9
-Stable tag: 3.0.4
+Stable tag: 3.1.1
 License: MIT License
 License URI: http://opensource.org/licenses/MIT
 
-Intentional Consent for WordPress — GDPR, CCPA, CPRA & ePrivacy compliance with consent records, autoblocking & Google Consent Mode v2.
+Intentional Consent for WordPress — GDPR, CCPA, CPRA & ePrivacy compliance with consent records, autoblocking, Google Consent Mode v2 & GPC support.
 
 == Description ==
 
@@ -93,12 +93,13 @@ As a part of our proactive approach, Cookie Compliance is configured by default 
 
 == Installation ==
 
-1. Install Compliance by Hu-manity.co either via the WordPress.org plugin directory, or by uploading the files to your server
-2. Activate the plugin through the 'Plugins' menu in WordPress
-3. Go to the Compliance settings and set your options.
-4. Click "Add Compliance features" button to start Cookie Compliance integration.
-5. Create Cookie Compliance account and select plan.
-6. Log in to Cookie Compliance web application anytime to customize the settings.
+1. Install Compliance by Hu-manity.co either via the WordPress.org plugin directory, or by uploading the files to your server.
+2. Activate the plugin through the 'Plugins' menu in WordPress.
+3. Go to Settings > Compliance in your WordPress admin — the setup wizard will launch automatically on first activation.
+4. Choose your setup path in the welcome screen: connect to Cookie Compliance (Free or Professional) for full compliance features, or select Banner Only to use the plugin standalone.
+5. If connecting: create a Cookie Compliance account or log into an existing one directly from the wizard — no need to leave WordPress.
+6. Select your plan, configure your banner using the guided checklist, and you're live.
+7. Return to Settings > Compliance any time to adjust your configuration, review consent logs in the Audit Trail, or manage your Cookie Compliance connection.
 
 == Privacy ==
 
@@ -191,8 +192,8 @@ Yes, but with limits. Cookie Compliance includes both free and paid plans to cho
 = Does Compliance by Hu-manity.co make my site fully compliant with GDPR or US Privacy Laws? =
 No. The plugin-only version DOES NOT include technical compliance features such as automatic script blocking, consent purpose categories, or consent record storage. These features are only available through the Cookie Compliance integration.
 
-= Does the Cookie Compiance integration make my site fully compliant with GDPR and US Privacy Laws? =
-Yes! The plugin + web appliaction version includes technical compliance features to meet requirements for over 100 countries and legal jurisdictions.
+= Does the Cookie Compliance integration make my site fully compliant with GDPR and US Privacy Laws? =
+Yes! The plugin + web application version includes technical compliance features to meet requirements for over 100 countries and legal jurisdictions.
 
 == Screenshots ==
 
@@ -202,6 +203,20 @@ Yes! The plugin + web appliaction version includes technical compliance features
 4. Cookie Compliance settings
 
 == Changelog ==
+
+= 3.1.1 =
+* Fix: The cookie compliance banner and per-form privacy consent prompts now render correctly on sites where Cloudflare Rocket Loader or a caching/optimizer plugin (WP Rocket, LiteSpeed Cache, Autoptimize, NitroPack, Jetpack Boost) defers script execution. The plugin's inline configuration and per-form helper scripts now signal these tools to skip them, extending the banner-script protection added in 3.0.3.
+* Tweak: The WordPress dashboard widget now shows a protection scorecard — GPC signal, consent records, and visit quota — replacing the previous usage chart.
+
+= 3.1.0 =
+* New: WP Consent API integration — Compliance now registers as the active Consent Management Platform under the [WP Consent API](https://wordpress.org/plugins/wp-consent-api/) when that plugin is installed, so cooperative plugins like WooCommerce, Google Site Kit, Burst Statistics, WP Statistics, AddToAny, and Pixel Manager for WooCommerce automatically gate themselves on the consent state captured by your banner. Hu-manity's four consent levels map to the WP Consent API's five categories: Strictly Necessary → functional (always allowed), Functional → preferences, Analytics → statistics and statistics-anonymous, Marketing → marketing. Global Privacy Control automatically suppresses the marketing category. A new "WP Consent API" toggle on the Configuration tab lets you turn the integration off; it is on by default when both plugins are active.
+* Tweak: The loading screen now reads "Hang tight — this may take a few seconds on slower connections" and the troubleshooting panel waits 15 seconds before appearing, giving slow connections more breathing room before setup suggestions surface.
+
+= 3.0.6 =
+* Tweak: The Consent Security Policy (CSP) warning on the Compliance settings page now clears immediately once a valid .htaccess is detected — reloading the page, clicking Purge Cache, or clicking Pull Configuration each re-evaluate in real time.
+
+= 3.0.5 =
+* Fix: Disabling Autoblocking via the legacy settings form on multisite sites now saves correctly.
 
 = 3.0.4 =
 * Fix: The Compliance settings page no longer breaks on sites where Cloudflare Rocket Loader or a caching/optimizer plugin (WP Rocket, LiteSpeed Cache, Autoptimize, NitroPack, SG Speed Optimizer, or Jetpack Boost) is configured to process WP admin scripts. The plugin's admin bundle now signals these tools to skip it, extending the same banner-script protection added in 3.0.3.
