@@ -3,8 +3,8 @@ Contributors: humanityco
 Tags: gdpr, ccpa, cookies, consent, privacy, gpc, google-consent-mode
 Requires at least: 4.9.6
 Requires PHP: 7.4
-Tested up to: 6.9
-Stable tag: 3.1.1
+Tested up to: 7.0
+Stable tag: 3.1.5
 License: MIT License
 License URI: http://opensource.org/licenses/MIT
 
@@ -51,7 +51,7 @@ Cookie Compliance gives you access to the most up-to-date formatting guidelines 
 * <strong>Consent analytics dashboard</strong> shows event data for number of visits and provides a “trust score” to help you track how site visitors are setting their consent. Make adjustments to your banner to improve your cookie acceptance rate and monitor progress via the consent activity graph.
 * <strong>Default configurations</strong> for GDPR, CCPA and more help to remove dark patterns and allow for quick and easy deployment of the consent banner without any guesswork. Customize the design of any default configuration to match the look and feel of your site.
 * <strong>Automatic script blocking</strong> blocks all non-essential cookie scripts and iFrames by default and <em>complies with valid consent rules under GDPR and other data protection laws</em>; in order to be compliant, your site must record visitor consent before setting or sending cookies.
-* <strong>Google Consent Mode</strong> ensures that your website can still gather valuable insights and perform effectively while respecting users' privacy preferences by <em>dynamically adjusting the behavior of Google services according to user consent.</em>
+* <strong>Google Consent Mode v2</strong> ensures that your website can still gather valuable insights and perform effectively while respecting users' privacy preferences by <em>dynamically adjusting the behavior of Google services (ad_storage, analytics_storage, ad_user_data, ad_personalization) according to user consent.</em>
 * <strong>Facebook Consent Mode</strong> allows your website to <em>measure the impact of your ads on Facebook</em>, track website activities and conversions and automatically deliver ads to Facebook if the user has agreed to.
 * <strong>Consent record storage</strong> automatically stores a record of each consent and makes these records available for export. <em>Complies with proof-of-consent requirements prescribed under GDPR and other data protection laws.</em>
 * <strong>Multilingual support</strong> automatically translates all banner text strings and allows you to provide custom translations for every text field to ensure visitors get a consistent consent experience.
@@ -203,6 +203,28 @@ Yes! The plugin + web application version includes technical compliance features
 4. Cookie Compliance settings
 
 == Changelog ==
+
+= 3.1.5 =
+* Fix: On sites using Gravity Forms with Google reCAPTCHA, forms can now be submitted as soon as a visitor accepts cookies — on the same page, with no reload. Previously the submit button could stay in a loading state indefinitely. Visitors who have not chosen yet are now asked to accept cookies, instead of seeing a button that appears to do nothing. Sites that have already moved Google Recaptcha to Basic Operations are unaffected.
+* Fix: On sites where visitors sign in — membership sites, online courses, shops — signed-in visitors now get cookie blocking and the correct consent signals to Google, Microsoft and Meta, the same as every other visitor. Previously any signed-in visitor was treated as someone working on the site: nothing was held back for them, and those services were told consent had been given before the visitor had answered the banner. Blocking is still switched off for users who can manage the banner, so you can keep working on your own site as before. If your site needs a wider exemption, a developer can adjust it with the `cn_manage_cookie_notice_cap` filter.
+
+= 3.1.4 =
+* Fix: On sites protected by a security plugin or firewall (such as WordFence), saving your settings after adding Google Tag Manager or analytics code could fail with a "403" error. The plugin now sends that code in a form these tools don't mistake for an attack, so your settings save normally.
+* Fix: The consent banner now displays and blocks cookies reliably on sites using a JavaScript optimizer — including WP Rocket, Autoptimize, LiteSpeed Cache, SiteGround Speed Optimizer, WP Fastest Cache, and WP Hummingbird's "Delay JavaScript". These tools could delay or combine the Cookie Compliance script, so the banner appeared late (or not at all) and cookies could load before a visitor consented; the plugin now signals them to leave its script alone, whether or not the plugin's "Caching Compatibility" option is enabled.
+
+= 3.1.3 =
+* Fix: On sites that use SiteGround Speed Optimizer, LiteSpeed Cache, or Breeze to combine, defer, or minify JavaScript, the plugin now reliably keeps the Cookie Compliance script out of those optimizations — so the banner displays and cookies stay blocked until a visitor consents. These tools could previously prevent the script from loading; this extends the compatibility added in 3.1.1.
+* Tweak: The plugin's upgrade screen now links you to the Admin Portal to complete a subscription there, with the plan pre-filled. Use it when you need a multi-domain plan, an invoice/VAT receipt, or a payment method other than card — all long available in the Admin Portal; the in-plugin card checkout remains available as before.
+* Tweak: Privacy-law settings now stay in sync with the Admin Portal. Per-region (geolocation) rules are configured in the Admin Portal and are respected when you save a law selection in the plugin, and each law's on-screen description reflects what the banner does on your plan.
+* Tweak: Standardized wording across the plugin — the Hu-manity.co web application is now consistently referred to as the "Admin Portal".
+
+= 3.1.2 =
+* Compatibility: Verified and confirmed compatible with WordPress 7.0.
+* Fix: Banner position and banner size now save correctly on sites without a Cookie Compliance subscription — since 3.0.1 these settings appeared to save but silently reverted on every reload.
+* Fix: Reconnecting a domain to a different Cookie Compliance app now refreshes its plan status right away — the visit-limit notice and autoblocking allowance update on save instead of lagging until the next hourly sync.
+* Fix: Account setup now confirms an explicit success response before activating a paid plan, so an incomplete or interrupted server reply can no longer leave an account on the wrong plan.
+* Tweak: Banner-script delivery is now server-controlled, so future banner improvements can roll out gradually and safely without requiring a plugin update. Your current banner is unchanged.
+* Tweak: Configuration and plan changes made in your Cookie Compliance dashboard now apply to your site faster. Previously a publish or plan upgrade could take until the next scheduled sync to take effect; your site now refreshes its settings right away via a secure server signal.
 
 = 3.1.1 =
 * Fix: The cookie compliance banner and per-form privacy consent prompts now render correctly on sites where Cloudflare Rocket Loader or a caching/optimizer plugin (WP Rocket, LiteSpeed Cache, Autoptimize, NitroPack, Jetpack Boost) defers script execution. The plugin's inline configuration and per-form helper scripts now signal these tools to skip them, extending the banner-script protection added in 3.0.3.

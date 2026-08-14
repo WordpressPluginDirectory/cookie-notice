@@ -115,9 +115,9 @@ class Cookie_Notice_Welcome_API {
 					]
 				);
 
-				// errors?
-				if ( ! empty( $result->message ) ) {
-					$response = [ 'error' => $result->message ];
+				// require an explicit success signal; anything else is an error
+				if ( empty( $result->success ) || $result->success !== true ) {
+					$response = [ 'error' => ! empty( $result->message ) ? $result->message : esc_html__( 'License assignment failed.', 'cookie-notice' ) ];
 					break;
 				}
 
@@ -1044,38 +1044,14 @@ class Cookie_Notice_Welcome_API {
 							else
 								$options['config']['dontSellLink'] = false;
 
-							// Build geolocationRules based on selected laws
-							$geolocation_rules = [];
-
-							foreach ( $options['regulations'] as $law => $enabled ) {
-								if ( ! $enabled )
-									continue;
-
-								// CCPA/otherus: Do Not Sell pattern
-								if ( in_array( $law, [ 'ccpa', 'otherus' ], true ) ) {
-									$geolocation_rules[] = [
-										'name'      => $law,
-										'display'   => true,
-										'blocking'  => false,
-										'revoke'    => false,
-										'privacy'   => false,
-										'doNotSell' => true,
-									];
-								} else {
-									// GDPR/LGPD/UKPECR/PIPEDA/POPIA: full blocking
-									$geolocation_rules[] = [
-										'name'      => $law,
-										'display'   => true,
-										'blocking'  => true,
-										'revoke'    => true,
-										'privacy'   => true,
-										'doNotSell' => false,
-									];
-								}
-							}
-
-							if ( ! empty( $geolocation_rules ) )
-								$options['config']['geolocationRules'] = $geolocation_rules;
+							// geolocationRules is intentionally NOT written here (OBS-28).
+							// Per-jurisdiction geolocation rules are owned by the Admin Portal.
+							// The plugin's flat law selection deliberately does not drive
+							// geolocationRules: the by-app PATCH endpoint deep-merges and
+							// preserves the stored (portal-tuned) rules when this key is
+							// omitted (Designer API userDesign.controller.ts merge + noDefaults
+							// schema). Writing a hardcoded matrix here previously clobbered
+							// Admin-Portal-tuned per-jurisdiction blocking rules on every law save.
 
 							// ── Auto-set compliance settings based on selected laws (#2143) ──────────
 							//
@@ -2063,6 +2039,11 @@ class Cookie_Notice_Welcome_API {
 			if ( ! empty( $result_raw['SubscriptionType'] ) )
 				$status_data['subscription'] = $cn->check_subscription( strtolower( $result_raw['SubscriptionType'] ) );
 
+			// Backend-controlled banner build selector (rides the same get_config
+			// response as SubscriptionType). 'v2' selects the v2 build; anything
+			// else (incl. absent/null) resolves to v1 in get_banner_channel().
+			$status_data['widget_version'] = ! empty( $result_raw['WidgetVersion'] ) ? sanitize_key( $result_raw['WidgetVersion'] ) : '';
+
 			if ( $status_data['subscription'] === 'basic' ) {
 				// get analytics data options
 				if ( $network )
@@ -2683,8 +2664,10 @@ class Cookie_Notice_Welcome_API {
 
 		$result = $this->request( $write_type, $params );
 
-		// Temporary diagnostic — log raw API response for consent mode debugging.
-		error_log( 'react_update_design API result: ' . var_export( $result, true ) );
+		// debug: log raw API response for consent mode debugging.
+		if ( $cn->options['general']['debug_mode'] ) {
+			error_log( 'react_update_design API result: ' . var_export( $result, true ) );
+		}
 
 		// Design record not yet created — fall back to quick_config to seed it.
 		// The API returns { i18n_msg: 'user_design_update_id_not_found', status: 400 } (HTTP 200)
