@@ -115,14 +115,30 @@ class Cookie_Notice_React_Admin_Ajax {
 		// ⚠️ Multisite pattern: use site_option ONLY when network-active with global_override.
 		// Do NOT simplify to is_multisite() alone — pattern matches welcome-api.php get_app_config().
 		$network       = $cn->is_network_options();
-		$analytics_raw = $network
-			? get_site_option( 'cookie_notice_app_analytics', [] )
-			: get_option( 'cookie_notice_app_analytics', [] );
+		$analytics_raw = Cookie_Notice_Store::get( 'cookie_notice_app_analytics', [], $network );
 
 		// --- Cycle usage (visits vs threshold) ---
 		// Read from cached analytics option; CN_DEV_MODE overrides for UI testing.
-		$visits    = ! empty( $analytics_raw['cycleUsage']->visits ) ? (int) $analytics_raw['cycleUsage']->visits : 0;
-		$threshold = ! empty( $analytics_raw['cycleUsage']->threshold ) ? (int) $analytics_raw['cycleUsage']->threshold : 0;
+		// Object vs array vs root-only threshold: see read_cycle_usage_counters().
+		$counters  = $cn->welcome_api->read_cycle_usage_counters( $analytics_raw );
+		$visits    = $counters['visits'];
+		$threshold = $counters['threshold'];
+
+		// Free plan with no readable cap: empty cache, a Pro leftover after
+		// paid→free (VisitThreshold NULL sanitises to 0), or a reconnect whose
+		// analytics cron has not run. App-id changes already force a pull in
+		// save_options(); plan changes do not. Skip when CN_DEV_MODE is driving
+		// the counters, so ?cn_usage=0 stays a real zero for UI testing.
+		$dev_usage = defined( 'CN_DEV_MODE' ) && CN_DEV_MODE && isset( $_POST['cn_usage'] );
+		$app_id    = isset( $cn->options['general']['app_id'] ) ? $cn->options['general']['app_id'] : '';
+
+		if ( ! $dev_usage && $cn->get_subscription() === 'basic' && $app_id !== '' && $threshold <= 0 ) {
+			$cn->welcome_api->get_app_analytics( $app_id, true, false );
+			$analytics_raw = Cookie_Notice_Store::get( 'cookie_notice_app_analytics', [], $network );
+			$counters      = $cn->welcome_api->read_cycle_usage_counters( $analytics_raw );
+			$visits        = $counters['visits'];
+			$threshold     = $counters['threshold'];
+		}
 
 		// CN_DEV_MODE: honour cn_usage=0-100 (forwarded as POST field by fetchDashboard
 		// since admin-ajax.php is a POST endpoint and $_GET params from the page URL
@@ -132,6 +148,29 @@ class Cookie_Notice_React_Admin_Ajax {
 			$threshold = $threshold > 0 ? $threshold : 1000;
 			$visits    = (int) round( $threshold * ( $pct / 100 ) );
 		}
+
+		// ── Begin dashboard threshold verdict (DEC-012)
+		//
+		// The plugin's verdict, not a re-derivation of visits >= threshold. React used to
+		// recompute the lockout from the two numbers above, which silently dropped every
+		// guard evaluate_threshold_exceeded() applies ( welcome-api.php ): a Pro plan
+		// carries no threshold and must never arm, and a snapshot the plugin cannot prove
+		// current fails OPEN rather than locking on stale counters. Recomputing also
+		// re-opens HS#47302, where a domain moved Free -> Pro kept enforcing the old app's
+		// threshold until the cron caught up.
+		//
+		// It matters because this flag decides whether the admin sees a live control or a
+		// greyed-out "Paused" one, while validate_options() and the React save path decide
+		// whether the change sticks — and those read threshold_exceeded(). Two different
+		// answers means the screen promises something the save will not honour.
+		$threshold_exceeded = (bool) $cn->threshold_exceeded();
+
+		// CN_DEV_MODE drives the lock from the forced usage above so the UI can be
+		// exercised at any percentage without touching the stored status.
+		if ( defined( 'CN_DEV_MODE' ) && CN_DEV_MODE && isset( $_POST['cn_usage'] ) ) {
+			$threshold_exceeded = $threshold > 0 && $visits >= $threshold;
+		}
+		// ── End dashboard threshold verdict (DEC-012)
 
 		// --- ConsentStats breakdown ---
 
@@ -151,32 +190,24 @@ class Cookie_Notice_React_Admin_Ajax {
 		// Regulations saved locally by cn_api_request?configure action.
 		// Exposed here so Protection.jsx LAWS card can display them without a
 		// Designer API round-trip. (#1897)
-		$reg_keys     = $network
-			? get_site_option( 'cookie_notice_app_regulations', [] )
-			: get_option( 'cookie_notice_app_regulations', [] );
+		$reg_keys     = Cookie_Notice_Store::get( 'cookie_notice_app_regulations', [], $network );
 		$regulations  = array_fill_keys( (array) $reg_keys, true );
 
 		// Language codes saved locally by react_apply_languages() on successful API write. (#1966)
 		// Always includes 'en' (default) + any additional codes the user configured.
-		$saved_languages = $network
-			? get_site_option( 'cookie_notice_app_languages', [] )
-			: get_option( 'cookie_notice_app_languages', [] );
+		$saved_languages = Cookie_Notice_Store::get( 'cookie_notice_app_languages', [], $network );
 		$language = array_values( array_unique( array_merge( [ 'en' ], (array) $saved_languages ) ) );
 
 		// Platform account email from login token (#2168).
 		// Stored in cookie_notice_app_token transient as ->email after successful login.
 		// Used in PortalBridgeModal to tell the user which email to sign in with.
 		// Returns empty string when not connected (token not set or expired).
-		$data_token    = $network
-			? get_site_transient( 'cookie_notice_app_token' )
-			: get_transient( 'cookie_notice_app_token' );
+		$data_token    = Cookie_Notice_Store::get_transient( 'cookie_notice_app_token', $network );
 		$account_email = ! empty( $data_token->email ) ? sanitize_email( $data_token->email ) : '';
 
 		// Banner design fields cached by get_app_config() — React computes
 		// the active template on the fly by matching against PRESETS.
-		$design = $network
-			? get_site_option( 'cookie_notice_app_design', [] )
-			: get_option( 'cookie_notice_app_design', [] );
+		$design = Cookie_Notice_Store::get( 'cookie_notice_app_design', [], $network );
 
 		wp_send_json_success( [
 			'analytics'        => [
@@ -184,6 +215,9 @@ class Cookie_Notice_React_Admin_Ajax {
 					'visits'    => $visits,
 					'threshold' => $threshold,
 				],
+				// Sibling of cycleUsage, not a field inside it: the counters are the
+				// vendor's data, this is the plugin's verdict about them.
+				'thresholdExceeded' => $threshold_exceeded,
 			],
 			'consentBreakdown' => $consent_breakdown,
 			'domainUrl'        => home_url(),
@@ -216,9 +250,7 @@ class Cookie_Notice_React_Admin_Ajax {
 
 		// ⚠️ Same multisite pattern as get_dashboard() — see comment there.
 		$network  = $cn->is_network_options();
-		$blocking = $network
-			? get_site_option( 'cookie_notice_app_blocking', [] )
-			: get_option( 'cookie_notice_app_blocking', [] );
+		$blocking = Cookie_Notice_Store::get( 'cookie_notice_app_blocking', [], $network );
 
 		wp_send_json_success( $this->build_blocking_response( $blocking ) );
 	}
@@ -345,9 +377,15 @@ class Cookie_Notice_React_Admin_Ajax {
 			$cn      = Cookie_Notice();
 			$network = $cn->is_network_options();
 
-			$blocking = $network
-				? get_site_option( 'cookie_notice_app_blocking', [] )
-				: get_option( 'cookie_notice_app_blocking', [] );
+			// is_network_options() is network-active && global_override — server state, so
+			// nothing here is forged. That is the trap: on such a network it resolves to
+			// network scope for EVERY caller, while verify_request() above proves only
+			// manage_options. Without this, any subsite administrator edits the autoblocking
+			// catalogue for every site, which is the pre-consent blocking guarantee.
+			if ( ! $cn->can_write_at_scope( $network ) )
+				wp_send_json_error( [ 'error' => $cn->network_scope_denied_message() ], 403 );
+
+			$blocking = Cookie_Notice_Store::get( 'cookie_notice_app_blocking', [], $network );
 
 			if ( empty( $blocking ) || ! isset( $blocking['providers'] ) ) {
 				wp_send_json_error( [ 'error' => 'No blocking configuration found.' ] );
@@ -392,11 +430,7 @@ class Cookie_Notice_React_Admin_Ajax {
 			}
 
 			// Save back.
-			if ( $network ) {
-				update_site_option( 'cookie_notice_app_blocking', $blocking );
-			} else {
-				update_option( 'cookie_notice_app_blocking', $blocking );
-			}
+			Cookie_Notice_Store::set( 'cookie_notice_app_blocking', $blocking, $network );
 		}
 
 		if ( $operation === 'add' ) {
@@ -418,9 +452,15 @@ class Cookie_Notice_React_Admin_Ajax {
 			$cn      = Cookie_Notice();
 			$network = $cn->is_network_options();
 
-			$blocking = $network
-				? get_site_option( 'cookie_notice_app_blocking', [] )
-				: get_option( 'cookie_notice_app_blocking', [] );
+			// is_network_options() is network-active && global_override — server state, so
+			// nothing here is forged. That is the trap: on such a network it resolves to
+			// network scope for EVERY caller, while verify_request() above proves only
+			// manage_options. Without this, any subsite administrator edits the autoblocking
+			// catalogue for every site, which is the pre-consent blocking guarantee.
+			if ( ! $cn->can_write_at_scope( $network ) )
+				wp_send_json_error( [ 'error' => $cn->network_scope_denied_message() ], 403 );
+
+			$blocking = Cookie_Notice_Store::get( 'cookie_notice_app_blocking', [], $network );
 
 			if ( ! is_array( $blocking ) ) {
 				$blocking = [];
@@ -487,11 +527,7 @@ class Cookie_Notice_React_Admin_Ajax {
 				];
 			}
 
-			if ( $network ) {
-				update_site_option( 'cookie_notice_app_blocking', $blocking );
-			} else {
-				update_option( 'cookie_notice_app_blocking', $blocking );
-			}
+			Cookie_Notice_Store::set( 'cookie_notice_app_blocking', $blocking, $network );
 
 			wp_send_json_success( [
 				'message'     => 'Script provider added.',
@@ -509,9 +545,15 @@ class Cookie_Notice_React_Admin_Ajax {
 			$cn      = Cookie_Notice();
 			$network = $cn->is_network_options();
 
-			$blocking = $network
-				? get_site_option( 'cookie_notice_app_blocking', [] )
-				: get_option( 'cookie_notice_app_blocking', [] );
+			// is_network_options() is network-active && global_override — server state, so
+			// nothing here is forged. That is the trap: on such a network it resolves to
+			// network scope for EVERY caller, while verify_request() above proves only
+			// manage_options. Without this, any subsite administrator edits the autoblocking
+			// catalogue for every site, which is the pre-consent blocking guarantee.
+			if ( ! $cn->can_write_at_scope( $network ) )
+				wp_send_json_error( [ 'error' => $cn->network_scope_denied_message() ], 403 );
+
+			$blocking = Cookie_Notice_Store::get( 'cookie_notice_app_blocking', [], $network );
 
 			if ( empty( $blocking ) || ! isset( $blocking['providers'] ) ) {
 				wp_send_json_error( [ 'error' => 'No blocking configuration found.' ] );
@@ -531,11 +573,7 @@ class Cookie_Notice_React_Admin_Ajax {
 				} ) );
 			}
 
-			if ( $network ) {
-				update_site_option( 'cookie_notice_app_blocking', $blocking );
-			} else {
-				update_option( 'cookie_notice_app_blocking', $blocking );
-			}
+			Cookie_Notice_Store::set( 'cookie_notice_app_blocking', $blocking, $network );
 
 			wp_send_json_success( [ 'message' => 'Script provider removed.' ] );
 		}
@@ -721,9 +759,7 @@ class Cookie_Notice_React_Admin_Ajax {
 
 		// Re-read the now-updated local cache and return it.
 		$network  = $cn->is_network_options();
-		$blocking = $network
-			? get_site_option( 'cookie_notice_app_blocking', [] )
-			: get_option( 'cookie_notice_app_blocking', [] );
+		$blocking = Cookie_Notice_Store::get( 'cookie_notice_app_blocking', [], $network );
 
 		// CN_DEV_MODE: inject sample trackers when the real scan returns empty,
 		// so the UI can be tested without real third-party scripts on the page.
@@ -1099,6 +1135,8 @@ class Cookie_Notice_React_Admin_Ajax {
 			'conditional_active',
 			'deactivation_delete',
 			'app_blocking',
+			// The engine is NOT quota-capped (DEC-012) — only the posture below is.
+			'app_blocking_engine',
 		];
 
 		foreach ( $bool_fields as $field ) {
@@ -1107,11 +1145,28 @@ class Cookie_Notice_React_Admin_Ajax {
 			}
 		}
 
-		// Server-side threshold enforcement: cap app_blocking to false when
-		// the free-plan visit limit is exceeded, matching settings.php:1965.
-		if ( ! empty( $options['app_blocking'] ) && $cn->threshold_exceeded() ) {
-			$options['app_blocking'] = false;
+		// ── Begin app_blocking quota freeze (#2272)
+		//
+		// While the Free-plan visit limit is exceeded the stored preference is FROZEN,
+		// not editable and not overwritable — the same contract the classic form has
+		// had since #2272 (it renders the checkbox disabled, omits its sentinel, and
+		// validate_options() then preserves the DB value).
+		//
+		// This path has no sentinel: React posts every key on every save, and the value
+		// it posts is the quota-forced false it was handed in cnReactData.options. So an
+		// admin who merely saves an unrelated setting while over quota would otherwise
+		// destroy their own autoblocking preference permanently — a cycle reset does not
+		// bring it back. Restore the remembered pre-force value instead of capping.
+		//
+		// Cookie_Notice::preserve_app_blocking_preference() is the backstop that covers
+		// the other wholesale writers of this array; this is the explicit statement of
+		// the rule on the one path that would otherwise look deliberate.
+		if ( $cn->threshold_exceeded() ) {
+			$options['app_blocking'] = $cn->app_blocking_stored !== null
+				? $cn->app_blocking_stored
+				: ! empty( $cn->options['general']['app_blocking'] );
 		}
+		// ── End app_blocking quota freeze (#2272)
 
 		// Text fields.
 		$text_fields = [
@@ -1300,7 +1355,17 @@ class Cookie_Notice_React_Admin_Ajax {
 		}
 
 		// Persist — network vs. single-site.
-		if ( isset( $_POST['cn_network'] ) && $_POST['cn_network'] ) {
+		//
+		// Scope comes from the claim recorded in Cookie_Notice::set_network_data() and
+		// vetted by Cookie_Notice::enforce_network_scope() on plugins_loaded, never from
+		// $_POST['cn_network'] directly. verify_request() above proves only manage_options,
+		// a site-level capability every subsite administrator holds, and $allowed carries
+		// app_id and app_key — so reading the raw field here let a subsite admin point
+		// every site on the network at their own Cookie Compliance account.
+		//
+		// $options is seeded from $cn->options['general'], which the constructor already
+		// picked using the same claim, so the two cannot disagree about scope.
+		if ( Cookie_Notice()->is_network_admin() ) {
 			update_site_option( 'cookie_notice_options', $options );
 		} else {
 			update_option( 'cookie_notice_options', $options );
@@ -1530,9 +1595,7 @@ class Cookie_Notice_React_Admin_Ajax {
 	private function get_level_labels() {
 		$cn      = Cookie_Notice();
 		$network = $cn->is_network_options();
-		$design  = $network
-			? get_site_option( 'cookie_notice_app_design', [] )
-			: get_option( 'cookie_notice_app_design', [] );
+		$design  = Cookie_Notice_Store::get( 'cookie_notice_app_design', [], $network );
 
 		return [
 			'level1' => ! empty( $design['levelNameText_1'] ) ? $design['levelNameText_1'] : 'Private',

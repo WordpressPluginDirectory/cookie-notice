@@ -13,6 +13,9 @@ class Cookie_Notice_Frontend {
 	private $compliance = false;
 	private $matched_handles = [];
 
+	/** Memoised banner-admin capability for this request. null = not yet asked. See is_banner_admin(). */
+	private $banner_admin = null;
+
 	/**
 	 * Class constructor.
 	 *
@@ -23,6 +26,7 @@ class Cookie_Notice_Frontend {
 		add_action( 'init', [ $this, 'early_init' ], 9 );
 		add_action( 'wp', [ $this, 'init' ] );
 		add_action( 'rest_api_init', [ $this, 'register_purge_route' ] );
+		add_action( 'cookie_notice_deferred_purge', [ $this, 'run_deferred_purge' ] );
 		add_action( 'wp_head', [ $this, 'wp_print_header_scripts' ] );
 		add_action( 'wp_print_footer_scripts', [ $this, 'wp_print_footer_scripts' ] );
 
@@ -54,20 +58,109 @@ class Cookie_Notice_Frontend {
 		// set compliance status
 		$this->compliance = ( $cn->get_status() === 'active' );
 
+		// ── Begin admin cache-bypass
+		//
+		// huOptions carries THREE values that differ for whoever administers the banner —
+		// `blocking` and `blockingEngine` (both switched off so they can work on the
+		// site) and `isAdmin` — and it is printed inline in the page HTML. So an admin's
+		// page and a visitor's page are different documents at the same URL.
+		//
+		// If a full-page cache stores the admin's copy and later serves it to the public,
+		// every visitor receives `blocking: false` and `blockingEngine: false`, which is
+		// strictly worse than either alone: autoblocking off for the whole site,
+		// trackers running before anyone has answered the banner. There is no error, no
+		// console warning and nothing visible in the admin screens — the owner could only
+		// find it with a network trace.
+		//
+		// Most caching plugins skip logged-in users by default, so this needs a particular
+		// setup to bite; the realistic one is a reverse proxy or CDN caching by URL while
+		// ignoring cookies. This plugin's users are, definitionally, people running
+		// aggressive caching — it ships compatibility modules for ten such plugins.
+		//
+		// ⚠️ This NARROWS the hole, it does not close it, and it is worth being precise
+		// about how far it reaches:
+		//
+		//   - It stops the cache being WRITTEN. It cannot evict a copy already stored,
+		//     because a page cache serves that copy without ever running PHP. A site that
+		//     has been poisoned stays poisoned until someone purges it — which is why the
+		//     changelog entry tells them to.
+		//   - An edge cache told to ignore origin rules will still ignore this.
+		//
+		// Headers are deliberately NOT sent here. WP::send_headers() already merges
+		// wp_get_nocache_headers() for every logged-in user before its own action fires
+		// (class-wp.php, and unchanged since well before this plugin's minimum supported
+		// version), so a callback of ours would re-send what is already on the wire and,
+		// on a feed, strip the Last-Modified core had just set. DONOTCACHEPAGE is the only
+		// signal this genuinely adds.
+		//
+		// Gated on compliance because that is what makes get_cc_options() run at all.
+		// NOTE that is narrower than "the documents are otherwise identical": the
+		// user_type conditional-display rule keys on is_user_logged_in(), so a site using
+		// it varies the banner's PRESENCE for a much wider set than banner admins, with a
+		// worse failure mode. Pre-existing and not addressed here.
+		if ( ! is_admin() && $this->compliance && $this->is_banner_admin() ) {
+			if ( ! defined( 'DONOTCACHEPAGE' ) )
+				define( 'DONOTCACHEPAGE', true );
+		}
+		// ── End admin cache-bypass
+
 		// cookie compliance initialization
 		if ( $this->compliance ) {
 			// amp compatibility
 			if ( $cn->options['general']['amp_support'] && cn_is_plugin_active( 'amp' ) )
 				include_once( COOKIE_NOTICE_PATH . 'includes/modules/amp/amp.php' );
 
-			// excluded script handles — stamp data-hu-category="1" so the widget never blocks them
-			if ( $cn->options['general']['app_blocking'] && ! empty( $cn->options['general']['excluded_handles'] ) ) {
+			// ── Begin excluded-handle stamping gate (DEC-012)
+			//
+			// Excluded script handles — stamp data-hu-category="1" so the widget never blocks them.
+			//
+			// Reads the AND of both stored options (blocking_is_active), never either
+			// alone. The engine alone would stamp handles on a site whose posture is off;
+			// the posture alone would stamp them on a site whose engine is off, where the
+			// widget can never block anything and the attribute is dead weight in the
+			// markup of every page. It is also the $cn-level state deliberately, NOT the
+			// $is_admin-exempted local computed later in get_cc_options() — this filter is
+			// registered once per request for everyone, and keying it on who is logged in
+			// would vary the HTML that a full-page cache serves to the public.
+			if ( $cn->blocking_is_active() && ! empty( $cn->options['general']['excluded_handles'] ) ) {
 				add_filter( 'script_loader_tag', [ $this, 'exclude_handles_from_blocking' ], 10, 2 );
 
 				if ( $cn->options['general']['debug_mode'] )
 					add_action( 'wp_footer', [ $this, 'debug_excluded_handles' ], 999 );
 			}
+			// ── End excluded-handle stamping gate (DEC-012)
 		}
+	}
+
+	/**
+	 * Whether the current user administers the banner.
+	 *
+	 * The single source for that question. It decides two things that must never disagree:
+	 * whether autoblocking is switched off for this request (huOptions.blocking), and
+	 * whether this request's HTML may be cached and served to somebody else.
+	 *
+	 * cn_manage_cookie_notice_cap is the escape hatch for a site whose banner is managed by
+	 * a role without manage_options — an agency editor, a shop manager. Widening it widens
+	 * the exemption AND the cache bypass together, which is the point: they are the same
+	 * decision.
+	 *
+	 * MEMOISED, and that is load-bearing rather than a micro-optimisation. The two callers
+	 * ask at different times — early_init() on `init` priority 9, get_cc_options() at
+	 * wp_head — so a plugin registering cn_manage_cookie_notice_cap in its own `init`
+	 * callback at the default priority 10 would land between them. One expression, two
+	 * answers: the gate would decide "not an admin, cacheable" while get_cc_options() wrote
+	 * blocking=false, which is precisely the silent drift this method exists to prevent.
+	 * Caching makes whichever caller asks first bind the answer for the whole request, so a
+	 * late-registered filter costs that user the exemption (they see blocking on — the safe
+	 * direction) instead of producing a cacheable unblocked page.
+	 *
+	 * @return bool
+	 */
+	public function is_banner_admin() {
+		if ( $this->banner_admin === null )
+			$this->banner_admin = current_user_can( apply_filters( 'cn_manage_cookie_notice_cap', 'manage_options' ) );
+
+		return $this->banner_admin;
 	}
 
 	/**
@@ -123,8 +216,20 @@ class Cookie_Notice_Frontend {
 
 		// compatibility fixes
 		if ( $this->compliance ) {
-			// is blocking active?
-			if ( $cn->options['general']['app_blocking'] ) {
+			// ── Begin captcha-rescue gate (DEC-012)
+			//
+			// Is blocking actually going to happen? The AND of both stored options
+			// (blocking_is_active), never either alone — and this one is load-bearing,
+			// not tidiness.
+			//
+			// These captcha-rescue shims exist to repair a captcha that autoblocking
+			// HELD. The CF7 one deregisters CF7's own reCAPTCHA initialiser and
+			// re-initialises from a cookies-unblocked.hu listener — an event the widget
+			// only dispatches when it actually released something. Load it on a site
+			// where the widget can never block ( engine off ), and the event never
+			// arrives, reCAPTCHA is never initialised, and every contact-form submission
+			// is rejected. Narrower than app_blocking is always safe here; wider is not.
+			if ( $cn->blocking_is_active() ) {
 				// contact form 7 compatibility
 				if ( cn_is_plugin_active( 'contactform7', 'captcha' ) )
 					include_once( COOKIE_NOTICE_PATH . 'includes/modules/contact-form-7/contact-form-7.php' );
@@ -132,7 +237,12 @@ class Cookie_Notice_Frontend {
 				// gravity forms compatibility
 				if ( cn_is_plugin_active( 'gravityforms', 'captcha' ) )
 					include_once( COOKIE_NOTICE_PATH . 'includes/modules/gravity-forms/gravity-forms.php' );
+
+				// bestwebsoft recaptcha compatibility
+				if ( cn_is_plugin_active( 'bestwebsoftrecaptcha', 'captcha' ) )
+					include_once( COOKIE_NOTICE_PATH . 'includes/modules/bestwebsoft-recaptcha/bestwebsoft-recaptcha.php' );
 			}
+			// ── End captcha-rescue gate (DEC-012)
 		}
 	}
 
@@ -346,13 +456,50 @@ class Cookie_Notice_Frontend {
 		// (HelpScout #47786). It is now scoped to the same capability the admin screens
 		// use; widen it with the cn_manage_cookie_notice_cap filter if a site genuinely
 		// needs a broader exemption.
-		$is_admin = current_user_can( apply_filters( 'cn_manage_cookie_notice_cap', 'manage_options' ) );
+		//
+		// Asked through is_banner_admin() rather than inline, because early_init() asks the
+		// same question to decide whether this request's HTML may be cached. Two copies of
+		// that capability check could drift, and the drift is silent: the page would carry
+		// blocking=false while being cacheable, i.e. served to visitors.
+		$is_admin = $this->is_banner_admin();
+
+		// ── Begin blockingEngine seeding (huOptions.blockingEngine)
+		//
+		// The widget splits the one overloaded 'blocking' flag into two questions, and
+		// this is the only place that can answer them. Since DEC-012 each has its own
+		// admin control and its own stored option — they are no longer two readings of
+		// one checkbox:
+		//
+		//   blockingEngine  IS the autoblocker allowed to touch this site at all?
+		//                   <- app_blocking_engine ("Script blocking engine")
+		//   blocking        WHAT posture applies before the visitor chooses?
+		//                   <- app_blocking ("Autoblocking"), unchanged in value,
+		//                      type, quota handling and every existing read
+		//
+		// The engine is ABSOLUTE in the widget (DEC-011): false means no script is held
+		// for anybody, whatever the geo rule or privacy signal, with no post-boot writer
+		// to undo it. It is therefore deliberately NOT quota-capped — only the posture is.
+		//
+		// An older widget that has never heard of blockingEngine simply ignores it, and
+		// a widget that reads it as ABSENT treats that as ON, so an un-updated widget is
+		// unaffected either way. Likewise a site whose stored options predate this key:
+		// multi_array_merge() resolves it to the default true on the very first request,
+		// so nobody is migrated into "off" by the upgrade.
+		//
+		// Both keys keep the $is_admin exemption `blocking` already had, for the same
+		// reason: whoever administers the banner needs the site un-blocked to work on it.
+		$app_blocking     = $cn->options['general']['app_blocking'];
+		$app_blocking_eng = $cn->options['general']['app_blocking_engine'];
+		$blocking_engine  = ! $is_admin ? (bool) $app_blocking_eng : false;
+		$blocking_posture = ! $is_admin ? $app_blocking : false;
+		// ── End blockingEngine seeding (huOptions.blockingEngine)
 
 		// prepare huOptions
 		$options = [
 			'appID'				=> $cn->options['general']['app_id'],
 			'currentLanguage'	=> $locale_code[0],
-			'blocking'			=> ! $is_admin ? $cn->options['general']['app_blocking'] : false,
+			'blockingEngine'	=> $blocking_engine,
+			'blocking'			=> $blocking_posture,
 			'globalCookie'		=> is_multisite() && $cn->options['general']['global_cookie'] && is_subdomain_install(),
 			'isAdmin'			=> $is_admin,
 			'privacyConsent'	=> ! empty( $sources )
@@ -399,55 +546,420 @@ class Cookie_Notice_Frontend {
 		else
 			$blocking = get_option( 'cookie_notice_app_blocking' );
 
-		// NOTE on the three *ConsentDefault keys below: the widget declares them in its
-		// option schema (Web Channel src/index.js) and then never reads them — it derives
-		// every Consent Mode signal from the BannerConfigJSON it fetches itself, via
-		// buildGoogleConsentFlags( options.config, categories ). Verified against both
-		// src/ and the deployed dist/ bundles. They are kept for wire compatibility, but
-		// nothing here changes live banner behaviour: do NOT reintroduce plan or quota
-		// gating on them expecting a frontend effect.
+		// Consent Mode signals live in $options['config'] (see the three seeding blocks
+		// below — Google, Facebook, Microsoft), because that is where the widget reads
+		// them: buildGoogleConsentFlags takes options.config, and the Facebook and
+		// Microsoft paths read options.config.*ConsentMap* directly.
+		// The former top-level googleConsentDefault / facebookConsentDefault
+		// / microsoftConsentDefault keys were declared in the widget's option schema and
+		// never read by it, so they had no effect on the banner at all; they are gone rather
+		// than left alongside a live sibling that differs from them by one nesting level.
+		// Do NOT reintroduce them: a plan or quota gate applied there changes nothing on the
+		// frontend, and the shape that does work is config.googleConsentMap*.
 		if ( ! empty( $blocking ) && is_array( $blocking ) ) {
 			$options['customProviders'] = ! empty( $blocking['providers'] ) && is_array( $blocking['providers'] ) ? $blocking['providers'] : [];
 			$options['customPatterns'] = ! empty( $blocking['patterns'] ) && is_array( $blocking['patterns'] ) ? $blocking['patterns'] : [];
 
-			// google consent mode default categories
+			// Seed the Google Consent Mode signals into huOptions.config so they are on the
+			// page at byte zero, instead of only after the widget's own config request lands.
+			//
+			// Why this is the ONLY place it can be fixed: the single code path that writes
+			// gtag('consent','default',...) is guarded on flags.configLoadedAfterObserver
+			// (Web Channel src/blocking.js:3421), i.e. it runs EXCLUSIVELY while the remote
+			// config has not arrived. It is structurally incapable of ever reading API
+			// values, so the map has to already be on the page or the first pageview of a
+			// session emits the widget's built-in fallbacks instead of the site's settings.
+			// Concretely: a site that mapped security_storage to 1 ("Basic Operations") got
+			// security_storage=denied on pageview 1 and granted thereafter.
+			//
+			// googleConsentMode travels with the map because it is what makes the map
+			// authoritative rather than provisional. blocking.js:1046 and :3566 stash a
+			// dataset.orgscript whenever !googleConsentMode — the comment there reads
+			// "consent mode is false or unknown" — so without the flag the widget cannot
+			// tell "this site has it switched off" from "we have not been told yet", and
+			// marks its own consent default as replaceable even for a site that has it on.
+			//
+			// No new sync is involved: welcome-api.php already stores these seven integers,
+			// pulled verbatim from BannerConfigJSON.googleConsentMap*, and populates
+			// google_consent_default ONLY when googleConsentMode is 1 — so a non-empty map
+			// IS the enabled flag. All eight keys are already declared in the widget's
+			// option schema (defaultParamTypes.config), so nothing changes widget-side.
+			//
+			// These are written AFTER the cn_cookie_compliance_args filter deliberately.
+			// The values mirror what the API is about to send, so letting them win keeps
+			// the cold pageview in agreement with every later one, and keeps consent
+			// signals out of reach of site-level overrides.
+			// ── Begin Google Consent Mode seeding (huOptions.config)
 			if ( ! empty( $blocking['google_consent_default'] ) && is_array( $blocking['google_consent_default'] ) ) {
-				$gcd = [];
+				// storage name as stored by welcome-api.php => widget config key
+				$gcm_signals = [
+					'ad_storage'				=> 'googleConsentMapAdStorage',
+					'analytics_storage'			=> 'googleConsentMapAnalytics',
+					'functionality_storage'		=> 'googleConsentMapFunctionality',
+					'personalization_storage'	=> 'googleConsentMapPersonalization',
+					'security_storage'			=> 'googleConsentMapSecurity',
+					'ad_personalization'		=> 'googleConsentMapAdPersonalization',
+					'ad_user_data'				=> 'googleConsentMapAdUserData'
+				];
 
-				foreach ( $blocking['google_consent_default'] as $storage => $category ) {
-					if ( in_array( $storage, ['ad_storage', 'analytics_storage', 'functionality_storage', 'personalization_storage', 'security_storage', 'ad_personalization', 'ad_user_data'], true ) )
-						$gcd[$storage] = (int) $category;
+				$seeded = [];
+
+				foreach ( $gcm_signals as $storage => $option_key ) {
+					if ( isset( $blocking['google_consent_default'][$storage] ) )
+						$seeded[$option_key] = (int) $blocking['google_consent_default'][$storage];
 				}
 
-				if ( ! empty( $gcd ) )
-					$options['googleConsentDefault'] = $gcd;
-			}
+				if ( ! empty( $seeded ) ) {
+					$seeded['googleConsentMode'] = true;
 
-			// facebook consent mode default categories
-			if ( ! empty( $blocking['facebook_consent_default'] ) && is_array( $blocking['facebook_consent_default'] ) ) {
-				$fcd = [];
-
-				foreach ( $blocking['facebook_consent_default'] as $storage => $category ) {
-					if ( in_array( $storage, ['consent'], true ) )
-						$fcd[$storage] = (int) $category;
+					$options['config'] = ! empty( $options['config'] ) && is_array( $options['config'] ) ? array_merge( $options['config'], $seeded ) : $seeded;
 				}
-
-				if ( ! empty( $fcd ) )
-					$options['facebookConsentDefault'] = $fcd;
 			}
+			// ── End Google Consent Mode seeding (huOptions.config)
 
-			// microsoft consent mode default categories
+			// Facebook and Microsoft are seeded for the same reason and on the same
+			// evidence as Google above — read that comment first; only the differences are
+			// repeated here.
+			//
+			// Same as Google: welcome-api.php already stores these integers and populates
+			// facebook_consent_default / microsoft_consent_default ONLY when the API says
+			// the mode is on, so a non-empty map IS the enabled flag. No plan gate belongs
+			// here either — both are Pro-only, but Designer API logic.service.ts::
+			// downgradeLiveDefaults has already reset them for a Free-plan app before the
+			// response we stored was built. Every key is already declared in the widget's
+			// option schema, so nothing changes widget-side.
+			//
+			// WHAT THESE FLAGS DO NOT DO — measured, because reading the source suggests
+			// otherwise. Unlike Google, whose re-block gate gets no input from
+			// googleConsentMode, both of these mode flags appear in a block decision:
+			// `if ( facebookConsentMode ) doNotBlock = true; else { …re-block… }`
+			// (Web Channel src/blocking.js:744) and `!flags.msDelayExecution &&
+			// !microsoftConsentMode` (:824, and :1041 for the main inline uet script).
+			// Read alone, those say seeding makes fbevents.js and bat.js load on the first
+			// pageview of a session where they were blocked before.
+			//
+			// They do not, in either install shape. Both branches are additionally gated on
+			// consentModeData.facebook.pixel / .microsoft.uet, which ONLY the inline snippet
+			// handler sets — and that handler's own re-block reads
+			// flags.configLoadedAfterObserver, not the mode flag, so the snippet stays
+			// blocked whether or not we seed. A blocked snippet never injects the vendor
+			// file. Measured 2026-08-20 across install shape x seeding, each arm a fresh
+			// session with the config response held past the observer
+			// (Web Channel tests/e2e/cold-window-vendor-consent.spec.js):
+			//
+			//   snippet-injected  unseeded -> no vendor request   seeded -> no vendor request
+			//   hard-coded <src>  unseeded -> request fires       seeded -> request fires
+			//
+			// The vendor-request columns are identical. The hard-coded row fires with
+			// seeding OFF, so that request is pre-existing and NOT caused by this — but it
+			// is a real pre-consent vendor call on the first pageview of every session for
+			// sites installed that way, cause not yet established (preload-scanner race, or
+			// blocking patterns not yet loaded). Worth its own investigation; do not read
+			// this block as having cleared it.
+			//
+			// The MAP values likewise cannot loosen anything for a visitor who has not
+			// consented: both vendors route through mapConsentSignal WITHOUT the `exempt`
+			// argument (blocking.js:3110, :3179), so index 1 returns 'denied' and indices
+			// 2/3/4 are all false pre-consent. They change only what a returning,
+			// already-consented visitor gets on their cold pageview — toward the site's own
+			// mapping.
+			//
+			// So the whole observable effect of this block is: correct map values for a
+			// returning consented visitor, and the authored consent value surviving instead
+			// of being replaced. Nothing gets looser.
+			//
+			// Seeding the maps WITHOUT the flags was rejected as inert: while the flag is
+			// falsy the widget stashes the untouched script in data-orgscript
+			// (blocking.js:1002, :1093, :1160) and events.js:969 puts it back once the config
+			// lands, discarding whatever we authored.
+			// ── Begin Facebook Consent Mode seeding (huOptions.config)
+			if ( ! empty( $blocking['facebook_consent_default'] ) && is_array( $blocking['facebook_consent_default'] ) && isset( $blocking['facebook_consent_default']['consent'] ) ) {
+				// one signal, so no table: 'consent' as stored by welcome-api.php =>
+				// facebookConsentMapConsent as read by the widget
+				$seeded = [
+					'facebookConsentMapConsent'	=> (int) $blocking['facebook_consent_default']['consent'],
+					'facebookConsentMode'		=> true
+				];
+
+				$options['config'] = ! empty( $options['config'] ) && is_array( $options['config'] ) ? array_merge( $options['config'], $seeded ) : $seeded;
+			}
+			// ── End Facebook Consent Mode seeding (huOptions.config)
+
+			// ── Begin Microsoft Consent Mode seeding (huOptions.config)
 			if ( ! empty( $blocking['microsoft_consent_default'] ) && is_array( $blocking['microsoft_consent_default'] ) ) {
-				$mcd = [];
+				// storage name as stored by welcome-api.php => widget config key. Note the
+				// analytics key is microsoftConsentMapAnalyticsStorage — Google's is
+				// googleConsentMapAnalytics, with no suffix. A wrong name is dropped by the
+				// widget's schema filter in silence.
+				$mcm_signals = [
+					'ad_storage'		=> 'microsoftConsentMapAdStorage',
+					'analytics_storage'	=> 'microsoftConsentMapAnalyticsStorage'
+				];
 
-				foreach ( $blocking['microsoft_consent_default'] as $storage => $category ) {
-					if ( in_array( $storage, ['ad_storage', 'analytics_storage'], true ) )
-						$mcd[$storage] = (int) $category;
+				$seeded = [];
+
+				foreach ( $mcm_signals as $storage => $option_key ) {
+					if ( isset( $blocking['microsoft_consent_default'][$storage] ) )
+						$seeded[$option_key] = (int) $blocking['microsoft_consent_default'][$storage];
 				}
 
-				if ( ! empty( $mcd ) )
-					$options['microsoftConsentDefault'] = $mcd;
+				if ( ! empty( $seeded ) ) {
+					$seeded['microsoftConsentMode'] = true;
+
+					// Pixie and Clarity are per-script switches under the same mode, and each
+					// gates its own data-orgscript stash (blocking.js:1056, :1160) — left unseeded
+					// they keep, for those two scripts, exactly the bug this block removes for
+					// uet. The only plugin-side copy of them is the raw BannerConfigJSON:
+					// welcome-api.php never cherry-picks them into microsoft_consent_default.
+					// (That is also why ConsentModesPanel.jsx:221-222 reads mscm.pixie /
+					// mscm.clarity and always gets undefined — a separate bug, not fixed here.)
+					// On an install whose stored blocking data predates banner_config they stay
+					// absent and the widget keeps its own false defaults, i.e. today's behaviour.
+					$banner_config = ! empty( $blocking['banner_config'] ) && is_array( $blocking['banner_config'] ) ? $blocking['banner_config'] : [];
+
+					foreach ( ['microsoftConsentModePixie', 'microsoftConsentModeClarity'] as $mode_key ) {
+						if ( isset( $banner_config[$mode_key] ) )
+							$seeded[$mode_key] = (bool) $banner_config[$mode_key];
+					}
+
+					$options['config'] = ! empty( $options['config'] ) && is_array( $options['config'] ) ? array_merge( $options['config'], $seeded ) : $seeded;
+				}
 			}
+			// ── End Microsoft Consent Mode seeding (huOptions.config)
+
+			// Seed the browser opt-out signal settings so GPC/DNT enforcement does not
+			// have to wait for the widget's own config request.
+			//
+			// The gap: forceBlocking is decided in the geolocation-update handler from
+			// config.gpcSupportMode / config.doNotTrackMode (Web Channel src/events.js,
+			// evaluateGpcDntEnforcement). Both default to FALSE in the widget, so on the
+			// first geolocation-update of a cold pageview — the one the save-session
+			// response fires — a GPC visitor gets no enforcement at all. The widget's own cache-path
+			// comment already names this failure ("without this re-fire, GPC/DNT
+			// enforcement and the new gpcBannerMode silent path silently miss any
+			// visitor whose config came from cache"); the same hole exists on the
+			// network path, and seeding is what puts the setting in place for it.
+			//
+			// ⚠️ Be precise about what that buys, because an earlier draft of this comment
+			// overstated it: seeding does NOT stop trackers already on the page. Raising the
+			// widget's blocking flag is not retroactive, so scripts scanned at byte zero were
+			// already let through — measured, both seeded and unseeded pages request gtag/js
+			// and analytics.js on a cold pageview. What the seed fixes is that the enforcement
+			// STATE is right earlier, which governs scripts injected after that point, banner
+			// suppression, and the suppression of a region-scoped consent grant for someone who
+			// has already opted out. gpcSupportMode is also read
+			// synchronously where the Google consent default is authored, to suppress
+			// region scoping for a visitor who has already opted out.
+			//
+			// ── Why these three are UNCONDITIONAL, when the four posture keys in the
+			// block below are gated on how old the snapshot is ──
+			//
+			// These three have no fail-open direction: no value of them releases a script
+			// or upgrades a signal. A stale `false` or an absent key is exactly today's
+			// behaviour, and a stale `true` over-suppresses. So they need no freshness
+			// bound and are seeded whenever they are present.
+			//
+			// The other four — geolocation / geolocationRules / regulations / consentLevel
+			// — can WIDEN a consent grant, and banner_config is a snapshot that can be
+			// stale: the config pull is a twicedaily WP-Cron event, and the
+			// server-to-server purge that normally refreshes it on publish
+			// (rest_purge_cache, below) does not exist before plugin 3.1.3 and is
+			// best-effort even after. A customer who tightens a rule — say lgpd from
+			// blocking:false to blocking:true, which our own Admin Portal flags crit —
+			// would keep serving the OLD posture on pageview 1 until the snapshot
+			// catches up, emitting a gtag consent default that grants analytics for
+			// their region. That command cannot be retracted, and the widget replays it
+			// verbatim after the live config has already landed. So those four carry a
+			// freshness bound — see the Posture seeding block below, which is where it
+			// now lives.
+			//
+			// Back to those three. A stale `true` on gpcSupportMode over-suppresses, which is
+			// the safe direction — but do NOT read
+			// that as "confined to the cold window". When the silent path fires it calls
+			// saveConsent(), persisting a level-1 `source:'gpc'` record and cookie. So an
+			// owner who switches GPC OFF in the portal keeps auto-recording consent for every
+			// GPC visitor until the snapshot refreshes (up to ~12h on the WP-Cron pull, longer
+			// if cron never fires), and
+			// each of those visitors then sees no banner for the life of that cookie (unless the
+			// site uses resetConsent) on a site that no longer honours GPC. Still fail-closed,
+			// still the right trade — but the effect outlives the staleness that caused it.
+			//
+			// Known, measured, accepted: seeding gpcSupportMode lets the GPC silent path
+			// run before the remote config, where the session record still carries the
+			// widget's built-in expiry (defaults.config.expiry, 30) and version.config 0
+			// rather than the site's own consentExpiry and config version. Across live
+			// apps ZERO have consentExpiry[0] below 30, so this can only ever shorten a
+			// consent window, never lengthen one; 25 apps see the shorter window and the
+			// audit field reads lastVersion 0. Both are widget-side quirks this exposes
+			// rather than creates.
+			//
+			// Per-key presence, deliberately: an absent key here means the widget
+			// receives nothing for it and falls back to its own default, because
+			// banner_config is a snapshot of the same /user-design-live response the
+			// widget itself fetches. gpcSupportMode is absent from most stored configs
+			// precisely because most sites do not use it — gating the block on it would
+			// disable the seed for the majority over a field they do not have.
+			// ── Begin Browser Signal seeding (huOptions.config)
+			$signal_config = ! empty( $blocking['banner_config'] ) && is_array( $blocking['banner_config'] ) ? $blocking['banner_config'] : [];
+
+			if ( ! empty( $signal_config ) ) {
+				$seeded = [];
+
+				foreach ( ['gpcSupportMode', 'doNotTrackMode'] as $signal_key ) {
+					if ( isset( $signal_config[$signal_key] ) )
+						$seeded[$signal_key] = (bool) $signal_config[$signal_key];
+				}
+
+				// Enum, not a boolean: 'banner' | 'hidden' | 'passive'. Seeded verbatim
+				// and NOT validated here — the widget resolves anything it does not
+				// recognise to 'passive', which is the suppressing choice, so a value
+				// added on the platform side keeps working without a plugin release.
+				// Inert while gpcSupportMode is falsy (only the GPC branch reads it), so
+				// it needs no gate of its own.
+				if ( isset( $signal_config['gpcBannerMode'] ) && is_string( $signal_config['gpcBannerMode'] ) && $signal_config['gpcBannerMode'] !== '' )
+					$seeded['gpcBannerMode'] = (string) $signal_config['gpcBannerMode'];
+
+				if ( ! empty( $seeded ) )
+					$options['config'] = ! empty( $options['config'] ) && is_array( $options['config'] ) ? array_merge( $options['config'], $seeded ) : $seeded;
+			}
+			// ── End Browser Signal seeding (huOptions.config)
+
+			// Seed the posture settings so the cold pageview decides on the site's real
+			// config instead of the widget's empty defaults.
+			//
+			// The gap: optOutRegionCodes (Web Channel src/blocking.js) returns [] unless
+			// config.geolocation === true, and the geolocation-update handler
+			// (src/events.js) skips the whole region matrix on the same condition. Both
+			// default FALSE in the widget, so on a cold pageview NO region rule is
+			// evaluated at all — the visitor is judged on the top-level posture alone,
+			// whatever the customer configured per region.
+			//
+			// That cuts both ways, which is the part worth writing down because an
+			// earlier read of this only saw one side:
+			//
+			//   - not seeding can UNDER-block. events.js sets options.blocking to
+			//     whatever the matched rule says, either direction. A geolocation-on site
+			//     whose top-level blocking is false but whose matched rule says true runs
+			//     permissive on pageview 1 and blocks on every later one.
+			//   - seeding can OVER-grant two ways, and an earlier draft named only the
+			//     second. (a) N1: the same events.js assignment above runs on the
+			//     geolocation-update the save-session response fires, BEFORE the live
+			//     config lands. An owner who tightened a rule — say ccpa from
+			//     blocking:false to true six hours ago — has a stale-but-under-12h
+			//     snapshot, so we seed the OLD matrix and a Californian's first pageview
+			//     releases scripts that today stay held until the live config arrives.
+			//     (b) N2: optOutRegionCodes collects a region ONLY where
+			//     rule.blocking === false, so the Google consent default it feeds can add
+			//     grants and never remove them, and a gtag consent/default command cannot
+			//     be retracted.
+			//
+			// The freshness bound is what makes the second case bounded rather than
+			// open-ended. Past it we seed nothing here and the cold pageview keeps
+			// exactly today's behaviour — no region rule, top-level posture only. So the
+			// failure mode of an unreachable site is the status quo, never something new.
+			//
+			// 12 hours EQUALS one config-pull interval (welcome-api.php check_cron registers
+			// twicedaily for an active app) — which is not the same as aligning with it.
+			// The next pull is due at last-run + 12h, so every cycle ends with a window
+			// where the snapshot has aged past the bound and the refresh has not landed,
+			// as long as the cron is late. That dilutes the seed on a quiet site; it does
+			// not endanger one, because past the bound we seed nothing.
+			//
+			// It is deliberately tight: the primary
+			// freshness mechanism is the publish-time purge, which reaches a healthy
+			// 3.1.3+ site in seconds and leaves this bound governing only the tail. A
+			// site that trips it loses the fix, not its safety.
+			//
+			// Pull time is the RIGHT clock here, unlike the case in L-044: the question
+			// this asks is "when did we last hear from the API", not "when was the config
+			// computed". Do not re-litigate it into the payload's own clock.
+			//
+			// ⚠️ The two blocks must not come apart. Seeding posture while dropping a
+			// PRESENT gpcSupportMode would fire a region grant at a visitor who has
+			// already opted out — the exact failure this whole area removed. The signal
+			// block above is unconditional, so a fresh snapshot seeds both and a stale
+			// one seeds only the signals, which is inert (no region command exists for
+			// them to suppress). Never make the signal block conditional on anything the
+			// posture block is conditional on.
+			//
+			// Per-key presence, same rule as above: banner_config is a snapshot of the
+			// same /user-design-live response the widget fetches, so an absent key here
+			// means the widget receives nothing for it either and falls back to its own
+			// default. Absent stays absent; do not invent one.
+			// ── Begin Posture seeding (huOptions.config)
+			$posture_config = ! empty( $blocking['banner_config'] ) && is_array( $blocking['banner_config'] ) ? $blocking['banner_config'] : [];
+
+			// strtotime() on the stored stamp, compared against GMT — the same shape
+			// welcome-api.php already uses for its own lastUpdated comparisons. A missing
+			// or unparseable stamp is treated as stale, not as fresh.
+			$pulled_at = ! empty( $blocking['lastUpdated'] ) ? strtotime( $blocking['lastUpdated'] ) : false;
+			$now       = current_time( 'timestamp', true );
+
+			// A FUTURE stamp is stale, not fresh. It does not mean "recent": a server clock
+			// three days ahead writes a stamp three days ahead, and once NTP corrects the
+			// clock every later read computes a NEGATIVE age, which passes any upper bound —
+			// so the snapshot would read fresh for three days. On a site where WP-Cron never
+			// fires, nothing rewrites the stamp and the bound is defeated outright, on
+			// exactly the population it exists to protect.
+			$age       = $pulled_at !== false ? $now - $pulled_at : false;
+			$is_fresh  = $age !== false && $age >= 0 && $age < 12 * HOUR_IN_SECONDS;
+
+			if ( $is_fresh && ! empty( $posture_config ) ) {
+				$seeded = [];
+
+				// bool in the widget schema; sanitize( 'bool', ... ) replaces a
+				// non-boolean with the fallback, and once seeded that fallback is the
+				// seeded value itself, so cast rather than pass through.
+				//
+				// geolocation is NOT a peer of the other three — it is the master switch that
+				// makes the widget consume geolocationRules/regulations at all. Seeding it TRUE
+				// without a matrix beside it is the one combination that is worse than seeding
+				// nothing: index.js falls through to its LEGACY branch and builds the matrix from
+				// the widget's own constants, where geolocationUSblocking and
+				// geolocationORblocking are both false — so a site with autoblocking ON hands
+				// options.blocking = false to every US and rest-of-world visitor on the cold
+				// pageview, decided by defaults that have nothing to do with that site.
+				//
+				// So a TRUE is seeded only when a USABLE matrix and its regulations travel with it.
+				// A FALSE is unconditional: it switches the matrix off and cannot reach the legacy
+				// branch.
+				//
+				// Match the WIDGET's condition, not a weaker proxy for it. index.js takes the new
+				// branch only on `geolocationRules.length > 0 && !isEmpty(regulations)`, so an empty
+				// rules array, or rules with no regulations beside them, both fall to LEGACY just as
+				// an absent matrix does. An earlier version of this guard tested only isset+is_array
+				// and so closed the absent case while leaving those two open — while the comment
+				// above claimed all three were shut. setOptions merges per property, so an unseeded
+				// regulations stays the widget default {}, and isEmpty({}) is true.
+				if ( isset( $posture_config['geolocation'] ) ) {
+					$geo_on     = (bool) $posture_config['geolocation'];
+					$has_matrix = ! empty( $posture_config['geolocationRules'] ) && is_array( $posture_config['geolocationRules'] )
+						&& ! empty( $posture_config['regulations'] ) && is_array( $posture_config['regulations'] );
+
+					if ( ! $geo_on || $has_matrix )
+						$seeded['geolocation'] = $geo_on;
+				}
+
+				// int in the widget schema. Decides WHAT a region command grants —
+				// inert at 1, grants at >= 2.
+				if ( isset( $posture_config['consentLevel'] ) )
+					$seeded['consentLevel'] = (int) $posture_config['consentLevel'];
+
+				// Structural values, seeded verbatim: the plugin holds no copy of the
+				// rule shape and must not grow one. Designer API injects the default
+				// 8-rule matrix into the RESPONSE whenever geolocation is on, and
+				// banner_config is that response — so there is nothing to default here
+				// and doing so would be a second source of truth for the matrix.
+				// A legitimate empty array is a real value and is seeded as one.
+				foreach ( ['geolocationRules', 'regulations'] as $structural_key ) {
+					if ( isset( $posture_config[$structural_key] ) && is_array( $posture_config[$structural_key] ) )
+						$seeded[$structural_key] = $posture_config[$structural_key];
+				}
+
+				if ( ! empty( $seeded ) )
+					$options['config'] = ! empty( $options['config'] ) && is_array( $options['config'] ) ? array_merge( $options['config'], $seeded ) : $seeded;
+			}
+			// ── End Posture seeding (huOptions.config)
 		}
 
 		if ( isset( $_GET['cn_preview'] ) && $_GET['cn_preview'] === '1' && current_user_can( 'manage_options' ) ) {
@@ -589,9 +1101,7 @@ class Cookie_Notice_Frontend {
 
 		// #2266: position is API-owned — read from cookie_notice_app_design for connected sites.
 		// Falls back to cookie_notice_options["general"]["position"] for disconnected/legacy-only installs.
-		$app_design      = $cn->is_network_options()
-			? get_site_option( 'cookie_notice_app_design', [] )
-			: get_option( 'cookie_notice_app_design', [] );
+		$app_design      = Cookie_Notice_Store::get( 'cookie_notice_app_design', [], $cn->is_network_options() );
 		$banner_position = ! empty( $app_design['position'] )
 			? sanitize_key( $app_design['position'] )
 			: ( $cn->options['general']['position'] ?? 'bottom' );
@@ -802,9 +1312,7 @@ class Cookie_Notice_Frontend {
 		// #2266: position is API-owned — read from cookie_notice_app_design for connected sites.
 		// Falls back to cookie_notice_options["general"]["position"] for disconnected/legacy-only installs.
 		// (Same resolution as add_cookie_notice() — duplicated here because this is a separate WP hook.)
-		$app_design      = $cn->is_network_options()
-			? get_site_option( 'cookie_notice_app_design', [] )
-			: get_option( 'cookie_notice_app_design', [] );
+		$app_design      = Cookie_Notice_Store::get( 'cookie_notice_app_design', [], $cn->is_network_options() );
 		$banner_position = ! empty( $app_design['position'] )
 			? sanitize_key( $app_design['position'] )
 			: ( $cn->options['general']['position'] ?? 'bottom' );
@@ -994,38 +1502,130 @@ class Cookie_Notice_Frontend {
 	 * "Purge Cache" button behave identically. A short per-site cooldown bounds
 	 * forced re-pull amplification toward our own Designer API.
 	 *
+	 * Responses: 200 { purged: true } when the re-pull ran; 202 { deferred: true,
+	 * scheduled_in } when the cooldown moved it to a single deferred event. Never
+	 * 429 — a rejected purge is a lost refresh, see the coalescing region below.
+	 *
 	 * @param WP_REST_Request $request
 	 * @return WP_REST_Response
 	 */
 	public function rest_purge_cache( $request ) {
-		$cn    = Cookie_Notice();
 		$creds = $this->get_app_credentials();
 
-		// per-site cooldown (2 min) — reject rapid repeats with 429
+		// ── Begin purge cooldown coalescing
+		// A per-site cooldown bounds forced re-pull amplification toward our own
+		// Designer API. What it must NOT do is DROP the purge. The caller (Designer
+		// API, app/services/cachePurge.service.ts) is a fire-and-forget `void` call
+		// with no retry and no queue, so a rejected purge is a LOST refresh: the site
+		// keeps serving the previously published config until the twicedaily WP-Cron
+		// pull catches up, up to ~12h later. The 429 this replaces did exactly that.
+		//
+		// That case is not rare, and it loses the config that matters most. Measured on
+		// prod 2026-08-27 (Designer API nginx access.log, 08:01–13:32 UTC): 3 of 31
+		// publishes were a second publish for the SAME app inside this window — one
+		// customer published six times in 22 minutes. The LAST publish of a burst is
+		// the one carrying what the customer wants live, and it was the one dropped.
+		//
+		// So a repeat inside the window defers instead of rejecting. wp_next_scheduled()
+		// is what makes this coalescing rather than queueing: N publishes inside one
+		// window collapse onto ONE deferred re-pull, so the amplification the cooldown
+		// exists to bound is still bounded — four publishes in two minutes cost two
+		// re-pulls, not four.
+		//
+		// WP-Cron has no daemon; the event fires on the first page load after expiry,
+		// not at expiry. That is not a regression. The twicedaily fallback this leans
+		// on depends on the same loopback, so deferring is never worse than dropping,
+		// and a site with no traffic fires neither while also serving stale config to
+		// nobody.
 		$cooldown    = 120;
-		$cooldown_at = $creds['network'] ? get_site_transient( 'cookie_notice_purge_cooldown' ) : get_transient( 'cookie_notice_purge_cooldown' );
+		$now         = current_time( 'timestamp', true );
+		$cooldown_at = Cookie_Notice_Store::get_transient( 'cookie_notice_purge_cooldown', $creds['network'] );
 
-		if ( $cooldown_at !== false )
-			return new WP_REST_Response( [ 'purged' => false, 'reason' => 'cooldown' ], 429 );
+		if ( $cooldown_at !== false ) {
+			// Land the event just past expiry so it cannot re-enter the cooldown it is
+			// waiting out. Floored at 1s in case the stored stamp is somehow ahead of now.
+			$remaining = max( 1, $cooldown - max( 0, $now - (int) $cooldown_at ) ) + 5;
+			$scheduled = wp_next_scheduled( 'cookie_notice_deferred_purge' );
 
-		if ( $creds['network'] )
-			set_site_transient( 'cookie_notice_purge_cooldown', current_time( 'timestamp', true ), $cooldown );
-		else
-			set_transient( 'cookie_notice_purge_cooldown', current_time( 'timestamp', true ), $cooldown );
+			// Already booked by an earlier repeat in this window — coalesce onto it
+			// rather than stacking a second event.
+			if ( $scheduled === false ) {
+				wp_schedule_single_event( $now + $remaining, 'cookie_notice_deferred_purge' );
+				$scheduled_in = $remaining;
+			} else {
+				$scheduled_in = max( 0, (int) $scheduled - $now );
+			}
+
+			return new WP_REST_Response( [ 'purged' => false, 'deferred' => true, 'scheduled_in' => (int) $scheduled_in ], 202 );
+		}
+		// ── End purge cooldown coalescing
+
+		Cookie_Notice_Store::set_transient( 'cookie_notice_purge_cooldown', $now, $cooldown, $creds['network'] );
+
+		$this->apply_purge( $creds['app_id'] );
+
+		return new WP_REST_Response( [ 'purged' => true ], 200 );
+	}
+
+	/**
+	 * Apply a purge: force a config + tier re-pull and bust the widget's client cache.
+	 *
+	 * Extracted so the synchronous REST path and the deferred path cannot drift apart.
+	 * ajax_purge_cache() (settings.php) is a third copy of this same sequence and is
+	 * deliberately left alone — folding it in here would widen the blast radius of a
+	 * freshness fix into the admin screen.
+	 *
+	 * @param string $app_id
+	 * @return void
+	 */
+	private function apply_purge( $app_id ) {
+		$cn = Cookie_Notice();
 
 		// force a config + tier re-pull (bypasses the 1h throttle)
-		$cn->welcome_api->get_app_config( $creds['app_id'], true );
+		$cn->welcome_api->get_app_config( $app_id, true );
 
 		// re-evaluate CSP state (parity with the admin Purge button)
 		$cn->settings->refresh_csp_notice( true );
 
 		// tell the frontend JS widget to bust its client cache
+		//
+		// DELIBERATELY NOT gated on can_write_at_scope() — unlike the two sibling copies of
+		// this sequence in settings.php and welcome-api.php, which are. This one runs on the
+		// REST purge route, authenticated by the app secret rather than by a user, so there is
+		// no current user for a capability test to resolve and adding one would refuse every
+		// legitimate purge. The actor is the platform, not a site administrator, and the value
+		// is a timestamp that changes no configuration.
 		if ( $cn->is_network_options() )
 			set_site_transient( 'cookie_notice_config_update', current_time( 'timestamp', true ), 600 );
 		else
 			set_transient( 'cookie_notice_config_update', current_time( 'timestamp', true ), 600 );
+	}
 
-		return new WP_REST_Response( [ 'purged' => true ], 200 );
+	/**
+	 * Run a purge that the cooldown deferred.
+	 *
+	 * Hooked on `cookie_notice_deferred_purge`, scheduled by rest_purge_cache() above.
+	 *
+	 * This needs its own hook rather than reusing `cookie_notice_get_app_config`:
+	 * that action is registered with add_action()'s default accepted_args of 1
+	 * (welcome-api.php), so a scheduled event passing [ app_id, true ] delivers only
+	 * the app id and silently drops force_update. The pull would then no-op against
+	 * the multisite global-override one-pull-per-hour throttle — a failure that
+	 * schedules cleanly, fires cleanly, and refreshes nothing.
+	 *
+	 * Deliberately does NOT reset the cooldown: doing so would let each deferred run
+	 * defer the next one, and a long burst would never actually re-pull.
+	 *
+	 * @return void
+	 */
+	public function run_deferred_purge() {
+		$creds = $this->get_app_credentials();
+
+		// unpaired between scheduling and firing — nothing to pull against
+		if ( $creds['app_id'] === '' )
+			return;
+
+		$this->apply_purge( $creds['app_id'] );
 	}
 
 }
