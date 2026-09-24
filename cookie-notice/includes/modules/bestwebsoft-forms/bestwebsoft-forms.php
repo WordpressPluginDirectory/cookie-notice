@@ -34,12 +34,12 @@ if ( ! defined( 'ABSPATH' ) )
  * actually blocked, so it is inert by construction on a site where reCAPTCHA is
  * essential, and the check would be duplicated ceremony.
  *
- * @class Cookie_Notice_Modules_BestWebSoftRecaptcha
+ * @class Cookie_Notice_Modules_BestWebSoftForms
  */
-class Cookie_Notice_Modules_BestWebSoftRecaptcha {
+class Cookie_Notice_Modules_BestWebSoftForms {
 
 	/** Our controller. */
-	const HANDLE = 'cn-bestwebsoft-recaptcha';
+	const HANDLE = 'cn-bestwebsoft-forms';
 
 	/**
 	 * Constructor.
@@ -57,7 +57,7 @@ class Cookie_Notice_Modules_BestWebSoftRecaptcha {
 	 * @return string
 	 */
 	private static function controller_path() {
-		return COOKIE_NOTICE_PATH . 'includes/modules/bestwebsoft-recaptcha/recaptcha.js';
+		return COOKIE_NOTICE_PATH . 'includes/modules/bestwebsoft-forms/consent-defer.js';
 	}
 
 	/**
@@ -93,7 +93,7 @@ class Cookie_Notice_Modules_BestWebSoftRecaptcha {
 
 		wp_enqueue_script(
 			self::HANDLE,
-			COOKIE_NOTICE_URL . '/includes/modules/bestwebsoft-recaptcha/recaptcha.js',
+			COOKIE_NOTICE_URL . '/includes/modules/bestwebsoft-forms/consent-defer.js',
 			[],
 			Cookie_Notice()->defaults['version'],
 			true
@@ -116,4 +116,4 @@ class Cookie_Notice_Modules_BestWebSoftRecaptcha {
 	}
 }
 
-new Cookie_Notice_Modules_BestWebSoftRecaptcha();
+new Cookie_Notice_Modules_BestWebSoftForms();

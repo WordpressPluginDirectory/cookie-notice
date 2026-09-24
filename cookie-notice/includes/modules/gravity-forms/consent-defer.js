@@ -30,6 +30,60 @@
 	var timedOut = false;
 
 	/**
+	 * Handle of the single in-flight poll, or null.
+	 *
+	 * releaseWhenReady() has four callers — immediate/DOMContentLoaded, gform/post_render,
+	 * and cookies-unblocked.hu — and any of them can fire while a poll is already running.
+	 * Without this, each armed its own interval against one shared timedOut flag, and the
+	 * FIRST to expire spoke for all of them.
+	 *
+	 * The case that mattered: post_render arms a poll at load; the visitor accepts at
+	 * t=19.5s, so the unblock handler clears timedOut and arms a second poll; at t=20.1s
+	 * the FIRST poll reaches POLL_TIMEOUT and sets timedOut = true while the second is
+	 * still legitimately waiting for api.js. The visitor submits and is told reCAPTCHA
+	 * failed to load and to reload the page — advice aimed at a visitor who never
+	 * consented, delivered to one who just did, and reloading is the one action that
+	 * discards their input without helping.
+	 *
+	 * Newest caller wins: a fresh invocation cancels the poll in flight before arming its
+	 * own. That is the right precedence — the later call reflects the more recent state
+	 * (consent just granted, or a form just rendered) than the one it replaces.
+	 */
+	var pollTimer = null;
+
+	/**
+	 * How long the CURRENT wait has run, in ms. Module-level, and deliberately not reset
+	 * by re-arming.
+	 *
+	 * Single-flight alone was not enough. With the counter local to releaseWhenReady(),
+	 * every call started the 20s budget over, and stopPolling() threw away the previous
+	 * closure's count — so POLL_TIMEOUT became unreachable for anyone re-arming faster
+	 * than the budget. Gravity Forms fires gform/post_render on every AJAX render,
+	 * including each page transition of a multi-page form, so a visitor stepping through
+	 * pages restarts it indefinitely. With Google genuinely unreachable, a COVERED
+	 * visitor would then be pinned on "still loading" forever and never told the load
+	 * failed — the same harm as the bug single-flight fixed, inverted: an old poll used
+	 * to speak too soon, and a new poll could stop any poll ever speaking.
+	 *
+	 * Reset only where a genuinely NEW wait begins: after a release, and on the unblock
+	 * event, where scripts have only just been allowed to load so the clock legitimately
+	 * starts again. A re-render is not a new wait — it is the same one, still running.
+	 */
+	var waited = 0;
+
+	/**
+	 * Cancel the in-flight poll, if any.
+	 *
+	 * @return {void}
+	 */
+	function stopPolling() {
+		if ( pollTimer !== null ) {
+			window.clearInterval( pollTimer );
+			pollTimer = null;
+		}
+	}
+
+	/**
 	 * Does this visitor's recorded consent COVER Google reCAPTCHA?
 	 *
 	 * This is what tells the two silences apart. grecaptcha being absent means "we are
@@ -113,6 +167,16 @@
 	}
 
 	/**
+	 * Held scripts that could still be released — i.e. minus the ones whose fetch already
+	 * failed. Interception keys on heldScripts(); waiting keys on this.
+	 *
+	 * @return {NodeList}
+	 */
+	function pendingScripts() {
+		return document.querySelectorAll( HELD_SELECTOR + ':not([data-cn-gf-recaptcha-failed="true"])' );
+	}
+
+	/**
 	 * Is a usable grecaptcha present? The add-on supports both the standard and
 	 * enterprise entry points, so accept either.
 	 *
@@ -143,6 +207,14 @@
 		}
 
 		Array.prototype.forEach.call( held, function( placeholder ) {
+			// Already tried and the fetch failed. Re-appending the same URL on every
+			// later render event achieves nothing but load on a dead endpoint and a
+			// message that flips wording each round — see the onerror handler below.
+			// The placeholder stays held, so the submit stays intercepted.
+			if ( placeholder.getAttribute( 'data-cn-gf-recaptcha-failed' ) === 'true' ) {
+				return;
+			}
+
 			var script = document.createElement( 'script' );
 			var src    = placeholder.getAttribute( 'data-cn-gf-recaptcha-src' );
 
@@ -164,9 +236,23 @@
 			// form post a token it has no way of producing.
 			script.onerror = function() {
 				timedOut = true;
+
+				// Put the placeholder back so the submit stays intercepted, but mark it
+				// SPENT so nothing tries this URL again. Without the mark, any later
+				// gform/post_render found grecaptcha present, re-entered the release path
+				// and re-appended the same failing <script> — once per render event,
+				// flipping the visitor's message between "did not load" and "accept
+				// cookies" each round, and hammering a URL that has already failed.
 				placeholder.setAttribute( 'data-cn-gf-recaptcha-src', src );
+				placeholder.setAttribute( 'data-cn-gf-recaptcha-failed', 'true' );
 				placeholder.removeAttribute( 'data-cn-gf-recaptcha-released' );
-				clearNotices();
+
+				// NOT clearNotices(). The visitor is mid-submit and a standing message is
+				// the only thing on screen telling them why the form will not go. Wiping
+				// it leaves them looking at a form that silently does nothing — the exact
+				// state this module exists to prevent. Re-word it in place instead, so the
+				// correction lands now rather than on a click that may never come.
+				refreshNotices();
 			};
 
 			// Mark it done rather than removing the placeholder, so a later pass can tell
@@ -185,23 +271,51 @@
 	 * @return {void}
 	 */
 	function releaseWhenReady() {
-		if ( ! heldScripts().length ) {
+		// Held AND still worth trying. A placeholder whose fetch already failed stays in
+		// heldScripts() — deliberately, so the submit stays intercepted — but release()
+		// will skip it forever, so it is not something to wait on.
+		if ( ! pendingScripts().length ) {
+			// Nothing left to wait for: everything is either out, or spent. Any poll still
+			// running is waiting on a question that has been answered, and can only expire
+			// and set a false timedOut.
+			//
+			// Returning BEFORE the ready branch below is what keeps a load failure
+			// reported. grecaptcha comes from Google's api.js, the bundle we could not
+			// fetch is the Gravity Forms add-on — so recaptchaReady() is typically still
+			// true after the failure. Falling into that branch cleared timedOut, while
+			// release() no-op'd on the spent placeholder, leaving the failure unreportable
+			// for the rest of the pageview.
+			stopPolling();
+
 			return;
 		}
 
 		if ( recaptchaReady() ) {
+			stopPolling();
+			waited   = 0;
 			timedOut = false;
 			release();
 
 			return;
 		}
 
-		var waited = 0;
-		var timer  = window.setInterval( function() {
+		// Single-flight: this call now owns the poll. See pollTimer. `waited` is NOT
+		// reset — this is a re-arm of the wait already in progress, not a new one.
+		stopPolling();
+
+		pollTimer = window.setInterval( function() {
 			waited += POLL_INTERVAL;
 
 			if ( recaptchaReady() ) {
-				window.clearInterval( timer );
+				// Reset here too, exactly as the ready branch at the top of
+				// releaseWhenReady() does. Both are "the wait ended in a release", and
+				// `waited` documents itself as resetting after a release — leaving one of
+				// the two paths out made the invariant false as written even though no
+				// observable failure followed from it, because any later call with held
+				// scripts takes the top branch and resets there. An invariant that is
+				// only accidentally true is one the next reader will be wrong about.
+				stopPolling();
+				waited   = 0;
 				timedOut = false;
 				release();
 			} else if ( waited >= POLL_TIMEOUT ) {
@@ -209,9 +323,15 @@
 				// against a still-absent grecaptcha and reproduce the original hang.
 				// Remember it, so the visitor is told reCAPTCHA failed to load rather
 				// than being asked to accept cookies they may already have accepted.
-				window.clearInterval( timer );
+				//
+				// The notice is left standing and re-worded. This used to clearNotices()
+				// here, which meant a pre-consent visitor's "Please accept cookies to
+				// submit this form" explanation vanished 20 seconds after they tried —
+				// leaving a form that does nothing and nothing on screen saying why, which
+				// is the state this module exists to prevent.
+				stopPolling();
 				timedOut = true;
-				clearNotices();
+				refreshNotices();
 			}
 		}, POLL_INTERVAL );
 	}
@@ -339,28 +459,59 @@
 	 * @param {Element} form
 	 * @return {void}
 	 */
+	function noticeText() {
+		if ( ! consentCoversRecaptcha() ) {
+			return strings.blockedMessage || 'Please accept cookies to submit this form.';
+		}
+
+		if ( timedOut ) {
+			return strings.unavailableMessage || 'This form could not be submitted because Google reCAPTCHA did not load.';
+		}
+
+		return strings.loadingMessage || 'This form is still loading. Please try again in a moment.';
+	}
+
 	function showNotice( form ) {
-		if ( form.getElementsByClassName( NOTICE_CLASS ).length ) {
+		var existing = form.getElementsByClassName( NOTICE_CLASS );
+
+		// One notice per form, UPDATED rather than left as first written. The pair above
+		// changes under the visitor — they accept the banner, or the 20s wait expires —
+		// and an early return here froze the message at whatever state was true the first
+		// time they clicked. Which is how removing clearNotices() broke the wording: that
+		// was the only thing that ever removed a notice, so with it gone and this an early
+		// return, no visitor could ever be shown a second, corrected message.
+		if ( existing.length ) {
+			existing[0].textContent = noticeText();
+
 			return;
 		}
 
 		var notice = document.createElement( 'p' );
-		var text;
 
 		notice.className = NOTICE_CLASS;
 		notice.setAttribute( 'role', 'alert' );
-
-		if ( ! consentCoversRecaptcha() ) {
-			text = strings.blockedMessage || 'Please accept cookies to submit this form.';
-		} else if ( timedOut ) {
-			text = strings.unavailableMessage || 'This form could not be submitted because Google reCAPTCHA did not load.';
-		} else {
-			text = strings.loadingMessage || 'This form is still loading. Please try again in a moment.';
-		}
-
-		notice.textContent = text;
+		notice.textContent = noticeText();
 
 		form.appendChild( notice );
+	}
+
+	/**
+	 * Re-word every standing notice for the current state.
+	 *
+	 * Called when the state changes underneath a notice already on screen, so the
+	 * correction does not wait for the visitor to click again. role="alert" means the
+	 * rewrite is announced, which is the point: the advice has genuinely changed.
+	 *
+	 * @return {void}
+	 */
+	function refreshNotices() {
+		var notices = document.getElementsByClassName( NOTICE_CLASS );
+		var text    = noticeText();
+		var i;
+
+		for ( i = 0; i < notices.length; i++ ) {
+			notices[ i ].textContent = text;
+		}
 	}
 
 	/**
@@ -410,9 +561,25 @@
 	 * inferring consent from it was not.
 	 */
 	document.addEventListener( 'cookies-unblocked.hu', function() {
-		timedOut = false;
+		// ...but only while something could still be released. Once every held bundle has
+		// failed to fetch, no later wait can happen, so clearing the flag here would only
+		// replace an accurate "reCAPTCHA did not load" with a "still loading" that will
+		// never resolve. A second unblock event is ordinary — the visitor reopens the
+		// banner and accepts another category.
+		if ( pendingScripts().length ) {
+			timedOut = false;
+
+			// A genuinely new wait: the scripts were blocked until this instant, so api.js
+			// only starts loading now and the budget legitimately restarts. This is the one
+			// event that resets it — see `waited`.
+			waited = 0;
+		}
 
 		releaseWhenReady();
+
+		// Consent just changed, so a standing notice may now be giving the wrong advice —
+		// a visitor told to "accept cookies" has just done exactly that.
+		refreshNotices();
 	}, false );
 
 	/**
